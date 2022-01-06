@@ -1,2 +1,5 @@
 venv/
 .idea/
+rootkey.csv
+.DS_Store
+Archive.zip

@@ -22,6 +22,11 @@ import boto3
 from botocore.exceptions import ClientError
 import requests
 from pydub import AudioSegment
+import csv
+import moviepy.editor as mp
+import json
+import codecs
+import datetime
 
 # Add relative path to include demo_tools in this code example without need for setup.
 sys.path.append('../..')
@@ -60,12 +65,16 @@ class VocabularyReadyWaiter(CustomWaiter):
 
 def start_job(
         job_name, media_uri, media_format, language_code, transcribe_client,
-        vocabulary_name=None):
+        vocabulary_name=None, more_settings={}):
     """
+
+
+
     Starts a transcription job. This function returns as soon as the job is started.
     To get the current status of the job, call get_transcription_job. The job is
     successfully completed when the job status is 'COMPLETED'.
 
+    :param more_settings: additional_settings added to jobargs bellow
     :param job_name: The name of the transcription job. This must be unique for
                      your AWS account.
     :param media_uri: The URI where the audio file is stored. This is typically
@@ -86,6 +95,11 @@ def start_job(
             'LanguageCode': language_code}
         if vocabulary_name is not None:
             job_args['Settings'] = {'VocabularyName': vocabulary_name}
+        if job_args.get('Settings', None):
+            job_args['Settings'].update(more_settings)
+        else:
+            if len(more_settings.items()) > 0:
+                job_args['Settings'] = more_settings
         response = transcribe_client.start_transcription_job(**job_args)
         job = response['TranscriptionJob']
         logger.info("Started transcription job %s.", job_name)
@@ -284,8 +298,6 @@ def delete_vocabulary(vocabulary_name, transcribe_client):
 
 
 def write_results_to_end(file_name, results):
-    # home = os.path.expanduser('~')
-    # results_path = os.path.join(home, 'Documents', 'transcriptions')
     if not os.path.exists(file_name):
         # os.makedirs(results_path)
         with open(file_name, 'w') as fd_for_file:
@@ -312,7 +324,10 @@ def replace_n(file_name):
                 write_fd_for_file.write(t.replace('/n', '\n'))
 
 
-def usage_demo_loop(path_to_dir):
+def aws_transcribe_loop_dir(path_to_dir, language_code):
+    with open('rootkey.csv', newline='') as csvfile:
+        config = {item[0]:item[1] for item in csv.reader(csvfile, delimiter='=')}
+        config['language_code'] = language_code
     for path, subdirs, files in os.walk(path_to_dir):
         for name in files:
             try:
@@ -321,10 +336,10 @@ def usage_demo_loop(path_to_dir):
                     fullWav = path + '/' + name
                     fullMp3name = path + '/' + short_name + '.mp3'
                     AudioSegment.from_wav(fullWav).export(fullMp3name, format="mp3")
-                    do_aws_transcription(file_name=fullMp3name)
+                    do_aws_transcription(file_name=fullMp3name, config=config )
                 else :
                     if extention == '.mp3':
-                        do_aws_transcription(path + '/' + name)
+                        do_aws_transcription(path + '/' + name, config)
                 if extention == '.txt':
                     replace_n(path + '/' + name)
             except Exception as e:
@@ -332,28 +347,106 @@ def usage_demo_loop(path_to_dir):
                 continue
 
 
-def do_aws_transcription(file_name):
+def remove_buckets():
+    csvfile = open('rootkey.csv', newline='')
+    config = {item[0]: item[1] for item in csv.reader(csvfile, delimiter='=')}
+    csvfile.close()
+    s3 = boto3.client('s3', aws_access_key_id=config['AWSAccessKeyId'], aws_secret_access_key=config['AWSSecretKey'])
+    buckets_dict = s3.list_buckets()
+    buckets_list = buckets_dict.get('Buckets', None)
+
+    s3resource = boto3.resource('s3',aws_access_key_id=config['AWSAccessKeyId'],
+                                aws_secret_access_key=config['AWSSecretKey'])
+
+    for item in buckets_list:
+        try:
+            if item['Name'] != 'zeev-bucket-1641252030744081000':
+                delete_res = s3resource.Object(item['Name'], '20211207-C0015.mp3').delete()
+                print(f"delete object response: {delete_res}")
+                b = s3resource.Bucket(item['Name'])
+
+                res = b.delete()
+                print("delete bucket response: {}".format(res))
+        except Exception as e:
+            print("delete error : {}".format(e))
+
+
+def convert_to_mp3(path_to_dir):
+    for path, subdirs, files in os.walk(path_to_dir):
+        for name in files:
+            try:
+                short_name, extension = os.path.splitext(name)
+                if extension in ['.MOV', '.mov', '.MP4', '.mp4']:
+                    full_movie_path = path + '/' + name
+                    full_mp3_path = path + '/' + short_name + '.mp3'
+                    clip = mp.VideoFileClip(full_movie_path)
+                    clip.audio.write_audiofile(full_mp3_path)
+            except Exception as err:
+                print("error: {}".format(err))
+                continue
+
+
+def parse_transcription_results(file_name):
+    name, extension = os.path.splitext(file_name)
+    with codecs.open(name + '_parsed_' + '.txt', 'w', 'utf-8') as dest_file:
+        with codecs.open(file_name, 'r', 'utf-8') as source_f:
+            data = json.loads(source_f.read())
+            labels = data['speaker_labels']['segments']
+            speaker_start_times = {}
+            for label in labels:
+                for item in label['items']:
+                    speaker_start_times[item['start_time']] = item['speaker_label']
+            items = data['items']
+            lines = []
+            line = ''
+            time = 0
+            speaker = 'null'
+            i = 0
+            for item in items:
+                i = i + 1
+                content = item['alternatives'][0]['content']
+                if item.get('start_time'):
+                    current_speaker = speaker_start_times[item['start_time']]
+                elif item['type'] == 'punctuation':
+                    line = line + content
+                if current_speaker != speaker:
+                    if speaker:
+                        lines.append({'speaker': speaker, 'line': line, 'time': time})
+                    line = content
+                    speaker = current_speaker
+                    time = item['start_time']
+                elif item['type'] != 'punctuation':
+                    line = line + ' ' + content
+            lines.append({'speaker': speaker, 'line': line, 'time': time})
+            sorted_lines = sorted(lines, key=lambda k: float(k['time']))
+            for line_data in sorted_lines:
+                line = '[' + str(
+                    datetime.timedelta(seconds=int(round(float(line_data['time']))))) + '] ' + line_data.get(
+                    'speaker') + ': ' + line_data.get('line')
+                dest_file.write(line + '\n\n')
+
+
+def do_aws_transcription(file_name, config):
     """Shows how to use the Amazon Transcribe service."""
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
     s3_resource = boto3.resource('s3',
-                                 aws_access_key_id=args['key_id'],
-                                 aws_secret_access_key=args['key_value']
+                                 aws_access_key_id=config['AWSAccessKeyId'],
+                                 aws_secret_access_key=config['AWSSecretKey']
                                  )
     transcribe_client = boto3.client('transcribe',
-                                     aws_access_key_id=args['key_id'],
-                                     aws_secret_access_key=args['key_value'],
+                                     aws_access_key_id=config['AWSAccessKeyId'],
+                                     aws_secret_access_key=config['AWSSecretKey'],
                                      region_name='eu-west-1')
 
-    bucket_name = f'jabber-bucket-{time.time_ns()}'
+    bucket_name = f'zeev-bucket'
     print(f"Creating bucket {bucket_name}.")
     bucket = s3_resource.create_bucket(
         Bucket=bucket_name,
         CreateBucketConfiguration={
             'LocationConstraint': transcribe_client.meta.region_name})
-    media_file_name = file_name if file_name else '/Users/yosefshachnovsky/Downloads/test1.mp3'
-    # media_object_key = 'Jabberwocky.mp3'
-    media_object_key = 'Jabberwocky.mp3'
+    media_file_name = file_name
+    media_object_key = f'{os.path.split(os.path.dirname(file_name))[1]}-{os.path.split(file_name)[1]}'
 
     pre, ext = os.path.splitext(media_file_name)
     result_file_name = pre + '.txt'
@@ -366,8 +459,8 @@ def do_aws_transcription(file_name):
     job_name_simple = f'Jabber-{time.time_ns()}'
     print(f"Starting transcription job {job_name_simple}.")
     start_job(
-        job_name_simple, f's3://{bucket_name}/{media_object_key}', 'mp3', 'he-IL',
-        transcribe_client)
+        job_name_simple, f's3://{bucket_name}/{media_object_key}', 'mp3', config['language_code'],
+        transcribe_client, more_settings={'ShowSpeakerLabels': True, 'MaxSpeakerLabels': 5})
     transcribe_waiter = TranscribeCompleteWaiter(transcribe_client)
     transcribe_waiter.wait(job_name_simple)
     job_simple = get_job(job_name_simple, transcribe_client)
@@ -378,19 +471,22 @@ def do_aws_transcription(file_name):
     for item in transcript_simple['results']['transcripts']:
         print("transcript item: ".format(item))
     print('-'*88)
-
+    results_json_path = os.path.splitext(result_file_name)[0] + '.json'
+    with open(results_json_path, "w") as outfile:
+        json.dump(transcript_simple.get('results', {"no": "results"}), outfile)
     for item in transcript_simple['results']['transcripts']:
         write_results_to_end(result_file_name, item['transcript'])
+
     # print("Creating a custom vocabulary that lists the nonsense words to try to "
     #       "improve the transcription.")
     # vocabulary_name = f'Jabber-vocabulary-{time.time_ns()}'
     # create_vocabulary(
-    #     vocabulary_name, 'en-US', transcribe_client,
+    #     vocabulary_name, config['language_code'], transcribe_client,
     #     phrases=[
-    #         'brillig', 'slithy', 'borogoves', 'mome', 'raths', 'Jub-Jub', 'frumious',
-    #         'manxome', 'Tumtum', 'uffish', 'whiffling', 'tulgey', 'thou', 'frabjous',
-    #         'callooh', 'callay', 'chortled'],
+    #         'יהודים','עברית','שפה', 'דקות','רוסיה','לצאת','עלייה',],
     #     )
+
+
     # vocabulary_ready_waiter = VocabularyReadyWaiter(transcribe_client)
     # vocabulary_ready_waiter.wait(vocabulary_name)
     #
@@ -446,15 +542,11 @@ def do_aws_transcription(file_name):
         print(vocab_content)
 
     print('-'*88)
-    print("Deleting demo jobs.")
-    for job_name in [job_name_simple]:
-        delete_job(job_name, transcribe_client)
-    print("Deleting demo vocabulary.")
-    delete_vocabulary(transcribe_client)
-    print("Deleting demo bucket.")
-    bucket.objects.delete()
-    bucket.delete()
-    print("Thanks for watching!")
+    # for job_name in [job_name_simple]:
+    #     delete_job(job_name, transcribe_client)
+    # delete_vocabulary(transcribe_client)
+    # bucket.objects.delete()
+    # bucket.delete()
 
 
 if __name__ == '__main__':
@@ -464,11 +556,17 @@ if __name__ == '__main__':
         parser = argparse.ArgumentParser(description=
                                          "This script transcribes all mp3 files in given working dir (wd)")
 
+        # parser.add_argument('-key_id', help='aws access key id', required=True)
+        # parser.add_argument('-key_value', help='aws access key id value', required=True)
+        parser.add_argument('-language_code', help='specify language_code', required=False)
         parser.add_argument('-wd', help='specify root directory from which to run script', required=True)
-        parser.add_argument('-key_id', help='aws access key id', required=True)
-        parser.add_argument('-key_value', help='aws access key id value', required=True)
 
         args = vars(parser.parse_args())
-        usage_demo_loop(args['wd'])
+        # aws_transcribe_loop_dir(args['wd'], args.get('language_code', None))
+        # convert_to_mp3(args['wd'])
+        # remove_buckets()
+        parse_transcription_results(args['wd'])
+
+
     except Exception as e:
         logging.error("error occured: {}".format(e))
